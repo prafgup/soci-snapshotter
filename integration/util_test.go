@@ -858,12 +858,6 @@ func getReferrers(sh *shell.Shell, regConfig registryConfig, imgName, digest str
 	return &index, nil
 }
 
-func stopContainerd(t *testing.T, sh *shell.Shell) {
-	if err := testutil.KillMatchingProcess(sh, "containerd"); err != nil {
-		t.Fatalf("failed to kill containerd: %v", err)
-	}
-}
-
 func rebootContainerd(t *testing.T, sh *shell.Shell, customContainerdConfig, customSnapshotterConfig string, monitorFuncs ...func(string)) *testutil.LogMonitor {
 	var (
 		containerdRoot    = "/var/lib/containerd"
@@ -873,8 +867,11 @@ func rebootContainerd(t *testing.T, sh *shell.Shell, customContainerdConfig, cus
 	)
 
 	// cleanup directories
-	stopContainerd(t, sh)
-	err := testutil.KillMatchingProcess(sh, "soci-snapshotter-grpc")
+	err := testutil.KillMatchingProcess(sh, "containerd")
+	if err != nil {
+		sh.Fatal("failed to kill containerd: %v", err)
+	}
+	err = testutil.KillMatchingProcess(sh, "soci-snapshotter-grpc")
 	if err != nil {
 		sh.Fatal("failed to kill soci: %v", err)
 	}

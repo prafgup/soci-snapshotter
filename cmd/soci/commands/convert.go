@@ -63,21 +63,7 @@ var ConvertCommand = &cli.Command{
 	Name:      "convert",
 	Usage:     "convert an OCI image to a SOCI enabled image",
 	ArgsUsage: "[flags] <image_ref> <dest_ref>",
-	Flags: slices.Concat(
-		internal.PlatformFlags,
-		createZtocFlags,
-		internal.PrefetchFlags,
-		[]cli.Flag{
-			&cli.BoolFlag{
-				Name:  "standalone",
-				Usage: "Run in standalone mode without containerd runtime. In this mode, the command will download the source image, perform the conversion, and push the converted image back to the registry without requiring a running containerd instance.",
-			},
-			&cli.BoolFlag{
-				Name:    "verbose",
-				Aliases: []string{"v"},
-				Usage:   "Show detailed progress output",
-			},
-		}),
+	Flags:     slices.Concat(internal.PlatformFlags, createZtocFlags, internal.PrefetchFlags),
 	Action: func(ctx context.Context, cmd *cli.Command) error {
 		srcRef := cmd.Args().Get(0)
 		if srcRef == "" {
@@ -94,8 +80,13 @@ var ConvertCommand = &cli.Command{
 			return fmt.Errorf("%w: %w", ErrInvalidDestRef, err)
 		}
 
-		if cmd.Bool("standalone") {
-			return runStandaloneConvert(ctx, cmd, srcRef, dstRef)
+		var optimizations []soci.Optimization
+		for _, o := range cmd.StringSlice(optimizationFlag) {
+			optimization, err := soci.ParseOptimization(o)
+			if err != nil {
+				return err
+			}
+			optimizations = append(optimizations, optimization)
 		}
 
 		client, ctx, cancel, err := internal.NewClient(ctx, cmd)
@@ -111,6 +102,10 @@ var ConvertCommand = &cli.Command{
 			return err
 		}
 
+		spanSize := cmd.Int64(spanSizeFlag)
+		minLayerSize := cmd.Int64(minLayerSizeFlag)
+		forceRecreateZtocs := cmd.Bool(forceRecreateZtocsFlag)
+
 		blobStore, err := store.NewContentStore(internal.ContentStoreOptions(ctx, cmd)...)
 		if err != nil {
 			return err
@@ -121,13 +116,25 @@ var ConvertCommand = &cli.Command{
 			return err
 		}
 
-		builderOpts, err := parseBuilderOptions(cmd)
-		if err != nil {
-			return err
+		builderOpts := []soci.BuilderOption{
+			soci.WithMinLayerSize(minLayerSize),
+			soci.WithSpanSize(spanSize),
+			soci.WithBuildToolIdentifier(buildToolIdentifier),
+			soci.WithOptimizations(optimizations),
+			soci.WithArtifactsDb(artifactsDb),
+			soci.WithForceRecreateZtocs(forceRecreateZtocs),
 		}
-		builderOpts = append(builderOpts, soci.WithArtifactsDb(artifactsDb))
+
+		allPrefetchFiles, err := internal.ParsePrefetchFiles(cmd)
+		if err != nil {
+			return fmt.Errorf("failed to parse prefetch files: %w", err)
+		}
+		if len(allPrefetchFiles) > 0 {
+			builderOpts = append(builderOpts, soci.WithPrefetchPaths(allPrefetchFiles))
+		}
 
 		builder, err := soci.NewIndexBuilder(cs, blobStore, builderOpts...)
+
 		if err != nil {
 			return err
 		}
@@ -171,98 +178,4 @@ var ConvertCommand = &cli.Command{
 
 		return err
 	},
-}
-
-// runStandaloneConvert runs the convert command in standalone mode (without containerd)
-func runStandaloneConvert(ctx context.Context, cmd *cli.Command, srcRef string, dstRef string) error {
-	verbose := cmd.Bool("verbose")
-	if verbose {
-		fmt.Printf("Standalone mode: downloading image %s\n", srcRef)
-	}
-
-	imageInfo, err := internal.DownloadImageFromRegistry(ctx, cmd, srcRef)
-	if err != nil {
-		return err
-	}
-	defer imageInfo.Cleanup()
-
-	builderOpts, err := parseBuilderOptions(cmd)
-	if err != nil {
-		return err
-	}
-
-	artifactsDb, err := soci.NewDB(soci.ArtifactsDbPath(imageInfo.TempDir))
-	if err != nil {
-		return fmt.Errorf("failed to create artifacts database: %w", err)
-	}
-	builderOpts = append(builderOpts, soci.WithArtifactsDb(artifactsDb))
-
-	sociStore := &store.SociStore{Store: imageInfo.OrasStore}
-
-	builder, err := soci.NewIndexBuilder(imageInfo.ContentStore, sociStore, builderOpts...)
-	if err != nil {
-		return err
-	}
-
-	requestedPlatforms, err := internal.GetPlatforms(ctx, cmd, imageInfo.Image, imageInfo.ContentStore)
-	if err != nil {
-		return err
-	}
-
-	batchCtx, done, err := sociStore.BatchOpen(ctx)
-	if err != nil {
-		return err
-	}
-	defer done(ctx)
-
-	if verbose {
-		fmt.Printf("Converting image to SOCI-enabled format with %d platform(s)\n", len(requestedPlatforms))
-	}
-
-	convertedDesc, err := builder.Convert(batchCtx, imageInfo.Image, soci.ConvertWithPlatforms(requestedPlatforms...))
-	if err != nil {
-		return err
-	}
-
-	if verbose {
-		fmt.Printf("Successfully created SOCI-enabled image: %s\n", convertedDesc.Digest)
-	}
-
-	if err := internal.PushConvertedImage(ctx, cmd, imageInfo, *convertedDesc, dstRef); err != nil {
-		return err
-	}
-
-	if verbose {
-		fmt.Println("Standalone mode: SOCI conversion completed successfully")
-	}
-	return nil
-}
-
-func parseBuilderOptions(cmd *cli.Command) ([]soci.BuilderOption, error) {
-	var optimizations []soci.Optimization
-	for _, o := range cmd.StringSlice("optimizations") {
-		optimization, err := soci.ParseOptimization(o)
-		if err != nil {
-			return nil, err
-		}
-		optimizations = append(optimizations, optimization)
-	}
-
-	builderOpts := []soci.BuilderOption{
-		soci.WithMinLayerSize(cmd.Int64(minLayerSizeFlag)),
-		soci.WithSpanSize(cmd.Int64(spanSizeFlag)),
-		soci.WithBuildToolIdentifier(buildToolIdentifier),
-		soci.WithOptimizations(optimizations),
-		soci.WithForceRecreateZtocs(cmd.Bool(forceRecreateZtocsFlag)),
-	}
-
-	allPrefetchFiles, err := internal.ParsePrefetchFiles(cmd)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse prefetch files: %w", err)
-	}
-	if len(allPrefetchFiles) > 0 {
-		builderOpts = append(builderOpts, soci.WithPrefetchPaths(allPrefetchFiles))
-	}
-
-	return builderOpts, nil
 }
