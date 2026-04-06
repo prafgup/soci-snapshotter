@@ -470,6 +470,14 @@ func (fs *filesystem) MountParallel(ctx context.Context, mountpoint string, labe
 	if !fs.inProgressImageUnpacks.ImageExists(imageDigest) {
 		err := fs.preloadAllLayers(ctx, desc, imageDigest, refspec, client)
 		if err != nil {
+			freshSrc, refreshErr := fs.refreshSources(ctx, labels, src)
+			if refreshErr == nil {
+				log.G(ctx).WithError(err).Warn("preloadAllLayers failed, retrying with fresh credentials")
+				client = freshSrc[0].Hosts[0].Client
+				err = fs.preloadAllLayers(ctx, desc, imageDigest, refspec, client)
+			}
+		}
+		if err != nil {
 			return fmt.Errorf("failed to preload layers for image manifest digest %s: %w", imageDigest, err)
 		}
 	}
@@ -752,72 +760,80 @@ func (fs *filesystem) MountLocal(ctx context.Context, mountpoint string, labels 
 	if !ok {
 		return fmt.Errorf("unable to get image ref from labels")
 	}
-	// Get source information of this layer.
+
+	attemptMountLocal := func(src []source.Source) error {
+		s := src[0]
+		client := s.Hosts[0].Client
+		refspec, err := reference.Parse(imageRef)
+		if err != nil {
+			return fmt.Errorf("cannot parse image ref (%s): %w", imageRef, err)
+		}
+		remoteStore, err := newRemoteBlobStore(refspec, client)
+		if err != nil {
+			return fmt.Errorf("cannot create remote store: %w", err)
+		}
+		fetcher, err := newArtifactFetcher(refspec, fs.contentStore, remoteStore)
+		if err != nil {
+			return fmt.Errorf("cannot create fetcher: %w", err)
+		}
+
+		desc := s.Target
+
+		// If the descriptor size is zero, the artifact fetcher will resolve it.
+		// However, it never returns this resolved descriptor.
+		// Since the unpacker is also in charge of storing the content and the
+		// ORAS store requires an expected size, we need to resolve here.
+		if desc.Size == 0 {
+			blobRef := remoteStore.Reference
+			blobRef.Reference = s.Target.Digest.String()
+			desc, err = remoteStore.Resolve(ctx, blobRef.String())
+			if err != nil {
+				return fmt.Errorf("cannot resolve size of layer (%s): %w", blobRef.String(), err)
+			}
+		}
+
+		imageDigest, ok := labels[ctdsnapshotters.TargetManifestDigestLabel]
+		if !ok {
+			return errors.New("layer has no image manifest attached")
+		}
+		manifest, err := fs.getImageManifest(ctx, imageDigest)
+		if err != nil {
+			return fmt.Errorf("cannot get image manifest: %w", err)
+		}
+		diffIDMap, err := fs.getDiffIDMap(ctx, manifest)
+		if err != nil {
+			return fmt.Errorf("error getting uncompressed shasums for image %s: %v", desc.Digest, err)
+		}
+		uncompressedDigest, ok := diffIDMap[desc.Digest.String()]
+		if !ok {
+			return fmt.Errorf("digest %s not found in image manifest", desc.Digest.String())
+		}
+
+		archive := NewLayerArchive(nil, newAsyncVerifier(uncompressedDigest.Verifier()), nil, nil)
+		unpacker := NewLayerUnpacker(fetcher, archive)
+
+		if err := unpacker.Unpack(ctx, desc, mountpoint, mounts); err != nil {
+			return fmt.Errorf("cannot unpack the layer: %w", err)
+		}
+		return nil
+	}
+
 	src, err := fs.getSources(labels)
 	if err != nil {
 		return err
 	} else if len(src) == 0 {
 		return fmt.Errorf("blob info not found for any labels in %s", fmt.Sprint(labels))
 	}
-	// download the target layer
-	s := src[0]
-	client := s.Hosts[0].Client
-	refspec, err := reference.Parse(imageRef)
-	if err != nil {
-		return fmt.Errorf("cannot parse image ref (%s): %w", imageRef, err)
-	}
-	remoteStore, err := newRemoteBlobStore(refspec, client)
-	if err != nil {
-		return fmt.Errorf("cannot create remote store: %w", err)
-	}
-	fetcher, err := newArtifactFetcher(refspec, fs.contentStore, remoteStore)
-	if err != nil {
-		return fmt.Errorf("cannot create fetcher: %w", err)
-	}
 
-	desc := s.Target
-
-	// If the descriptor size is zero, the artifact fetcher will resolve it.
-	// However, it never returns this resolved descriptor.
-	// Since the unpacker is also in charge of storing the content and the
-	// ORAS store requires an expected size, we need to resolve here.
-	if desc.Size == 0 {
-		// In remoteStore.Reference, Registry and Target should be correct.
-		// However, we need Reference to point to the current layer.
-		blobRef := remoteStore.Reference
-		blobRef.Reference = s.Target.Digest.String()
-		desc, err = remoteStore.Resolve(ctx, blobRef.String())
-		if err != nil {
-			return fmt.Errorf("cannot resolve size of layer (%s): %w", blobRef.String(), err)
+	err = attemptMountLocal(src)
+	if err != nil {
+		freshSrc, refreshErr := fs.refreshSources(ctx, labels, src)
+		if refreshErr == nil {
+			log.G(ctx).WithError(err).Warn("MountLocal failed, retrying with fresh credentials")
+			err = attemptMountLocal(freshSrc)
 		}
 	}
-
-	imageDigest, ok := labels[ctdsnapshotters.TargetManifestDigestLabel]
-	if !ok {
-		return errors.New("layer has no image manifest attached")
-	}
-	manifest, err := fs.getImageManifest(ctx, imageDigest)
-	if err != nil {
-		return fmt.Errorf("cannot get image manifest: %w", err)
-	}
-	diffIDMap, err := fs.getDiffIDMap(ctx, manifest)
-	if err != nil {
-		return fmt.Errorf("error getting uncompressed shasums for image %s: %v", desc.Digest, err)
-	}
-	uncompressedDigest, ok := diffIDMap[desc.Digest.String()]
-	if !ok {
-		return fmt.Errorf("digest %s not found in image manifest", desc.Digest.String())
-	}
-
-	archive := NewLayerArchive(nil, newAsyncVerifier(uncompressedDigest.Verifier()), nil, nil)
-	unpacker := NewLayerUnpacker(fetcher, archive)
-
-	err = unpacker.Unpack(ctx, desc, mountpoint, mounts)
-	if err != nil {
-		return fmt.Errorf("cannot unpack the layer: %w", err)
-	}
-
-	return nil
+	return err
 }
 
 func (fs *filesystem) getSociContext(ctx context.Context, imageRef, indexDigest, imageManifestDigest string, client *http.Client) (*sociContext, error) {
@@ -1019,6 +1035,53 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
 		return fmt.Errorf("unable to get image digest from labels")
 	}
 
+	// attemptResolve fetches the SOCI context and resolves the target layer
+	// using the provided sources. Each call creates its own channels and goroutine,
+	// so it is safe to retry with fresh sources.
+	attemptResolve := func(src []source.Source) (layer.Layer, *sociContext, error) {
+		client := src[0].Hosts[0].Client
+		c, err := fs.getSociContext(ctx, imageRef, sociIndexDigest, imgDigest, client)
+		if err != nil {
+			return nil, nil, fmt.Errorf("unable to fetch SOCI artifacts for image %q: %w", imageRef, err)
+		}
+
+		resultChan := make(chan layer.Layer, 1)
+		errChan := make(chan error, 1)
+		go func() {
+			var rErr error
+			for _, s := range src {
+				sociDesc, ok := c.imageLayerToSociDesc[s.Target.Digest.String()]
+				if !ok {
+					log.G(ctx).WithFields(logrus.Fields{
+						"layerDigest": s.Target.Digest.String(),
+						"image":       s.Name.String(),
+					}).Infof("skipping mounting layer as FUSE mount: %v", snapshot.ErrNoZtoc)
+					rErr = fmt.Errorf("skipping mounting layer %s as FUSE mount: %w", s.Target.Digest.String(), snapshot.ErrNoZtoc)
+					break
+				}
+
+				prefetchDesc := c.findPrefetchArtifact(s.Target.Digest.String())
+
+				l, err := fs.resolver.Resolve(ctx, s.Hosts, s.Name, s.Target, sociDesc, c.fuseOperationCounter, fs.disableVerification, prefetchDesc)
+				if err == nil {
+					resultChan <- l
+					return
+				}
+				rErr = fmt.Errorf("failed to resolve layer %q from %q: %w", s.Target.Digest, s.Name, err)
+			}
+			errChan <- rErr
+		}()
+
+		select {
+		case l := <-resultChan:
+			return l, c, nil
+		case err := <-errChan:
+			return nil, c, err
+		case <-time.After(fs.mountTimeout):
+			return nil, c, fmt.Errorf("timeout waiting for layer %s to resolve", labels[ctdsnapshotters.TargetLayerDigestLabel])
+		}
+	}
+
 	// Get source information of this layer.
 	src, err := fs.getSources(labels)
 	if err != nil {
@@ -1026,44 +1089,25 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
 	} else if len(src) == 0 {
 		return fmt.Errorf("source must be passed")
 	}
-	client := src[0].Hosts[0].Client
-	c, err := fs.getSociContext(ctx, imageRef, sociIndexDigest, imgDigest, client)
+
+	l, c, err := attemptResolve(src)
 	if err != nil {
-		return fmt.Errorf("unable to fetch SOCI artifacts for image %q: %w", imageRef, err)
-	}
-
-	// Resolve the target layer
-	var (
-		resultChan = make(chan layer.Layer)
-		errChan    = make(chan error)
-	)
-	go func() {
-		var rErr error
-		for _, s := range src {
-			sociDesc, ok := c.imageLayerToSociDesc[s.Target.Digest.String()]
-			if !ok {
-				log.G(ctx).WithFields(logrus.Fields{
-					"layerDigest": s.Target.Digest.String(),
-					"image":       s.Name.String(),
-				}).Infof("skipping mounting layer as FUSE mount: %v", snapshot.ErrNoZtoc)
-				rErr = fmt.Errorf("skipping mounting layer %s as FUSE mount: %w", s.Target.Digest.String(), snapshot.ErrNoZtoc)
-				break
-			}
-
-			prefetchDesc := c.findPrefetchArtifact(s.Target.Digest.String())
-
-			l, err := fs.resolver.Resolve(ctx, s.Hosts, s.Name, s.Target, sociDesc, c.fuseOperationCounter, fs.disableVerification, prefetchDesc)
-			if err == nil {
-				resultChan <- l
-				return
-			}
-			rErr = fmt.Errorf("failed to resolve layer %q from %q: %w", s.Target.Digest, s.Name, err)
+		freshSrc, refreshErr := fs.refreshSources(ctx, labels, src)
+		if refreshErr == nil {
+			log.G(ctx).WithError(err).Warn("layer resolution failed, retrying with fresh credentials")
+			fs.sociContexts.Delete(imgDigest)
+			l, c, err = attemptResolve(freshSrc)
+			src = freshSrc
 		}
-		errChan <- rErr
-	}()
+	}
+	if err != nil {
+		retErr = err
+		return
+	}
 
 	ns, ok := namespaces.Namespace(ctx)
 	if !ok {
+		l.Done()
 		return errors.New("could not find namespace attached to context")
 	}
 	// Also resolve and cache other layers in parallel
@@ -1094,21 +1138,6 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
 		})
 	}
 
-	// Wait for resolving completion
-	var l layer.Layer
-	select {
-	case l = <-resultChan:
-	case err := <-errChan:
-		retErr = err
-		return
-	case <-time.After(fs.mountTimeout):
-		log.G(ctx).WithFields(logrus.Fields{
-			"timeout":     fs.mountTimeout.String(),
-			"layerDigest": labels[ctdsnapshotters.TargetLayerDigestLabel],
-		}).Info("timeout waiting for layer to resolve")
-		retErr = fmt.Errorf("timeout waiting for layer %s to resolve", labels[ctdsnapshotters.TargetLayerDigestLabel])
-		return
-	}
 	defer func() {
 		if retErr != nil {
 			l.Done() // don't use this layer.
@@ -1259,6 +1288,19 @@ func (fs *filesystem) refreshLayer(ctx context.Context, l layer.Layer, labels ma
 		}
 	}
 	return src, errors.Join(errs...)
+}
+
+// refreshSources invalidates cached registry hosts for all given sources
+// and returns fresh sources with new credentials.
+func (fs *filesystem) refreshSources(ctx context.Context, labels map[string]string, src []source.Source) ([]source.Source, error) {
+	if fs.invalidateHosts == nil {
+		return nil, fmt.Errorf("host invalidation not available")
+	}
+	for _, s := range src {
+		log.G(ctx).Debugf("Invalidating cached registry hosts for source %q", s.Name)
+		fs.invalidateHosts(s.Name.String())
+	}
+	return fs.getSources(labels)
 }
 
 func isIDMappedDir(mountpoint string) bool {
