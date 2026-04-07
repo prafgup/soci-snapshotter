@@ -47,6 +47,7 @@ import (
 	"github.com/awslabs/soci-snapshotter/fs/remote"
 	"github.com/awslabs/soci-snapshotter/fs/source"
 	"github.com/awslabs/soci-snapshotter/idtools"
+	ctdsnapshotters "github.com/containerd/containerd/pkg/snapshotters"
 	"github.com/containerd/containerd/reference"
 	"github.com/containerd/containerd/remotes/docker"
 	fusefs "github.com/hanwen/go-fuse/v2/fs"
@@ -114,6 +115,109 @@ func TestCheckSucceedsAfterInvalidation(t *testing.T) {
 	if invalidatedRef != expectedRef.String() {
 		t.Errorf("invalidateHosts called with %q; wanted %q", invalidatedRef, expectedRef.String())
 	}
+	if refreshCount != 2 {
+		t.Errorf("expected 2 refreshLayer calls, got %d", refreshCount)
+	}
+}
+
+func TestCheckSucceedsWithFallbackRef(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	refreshCount := 0
+	var invalidatedRefs []string
+
+	bl := &breakableLayer{}
+	bl.success = false
+
+	oldRef := reference.Spec{Locator: "registry.example.com/repo/image", Object: "old-tag"}
+	newRef := reference.Spec{Locator: "registry.example.com/repo/image", Object: "new-tag"}
+
+	fs := &filesystem{
+		layer: map[string]layer.Layer{
+			"test": bl,
+		},
+		getSources: func(labels map[string]string) ([]source.Source, error) {
+			refreshCount++
+			refStr := labels[ctdsnapshotters.TargetRefLabel]
+			ref, _ := reference.Parse(refStr)
+			// Only succeed when using the new (fallback) ref.
+			if ref.String() == newRef.String() {
+				bl.success = true
+			}
+			return []source.Source{
+				{Name: ref},
+			}, nil
+		},
+		invalidateHosts: func(ref string) {
+			invalidatedRefs = append(invalidatedRefs, ref)
+		},
+	}
+
+	// Set fallback ref in context (simulates what Prepare does).
+	ctx = source.WithFallbackImageRef(ctx, newRef.String())
+
+	// Labels point to the old ref (simulates stale snapshot labels).
+	labels := map[string]string{
+		ctdsnapshotters.TargetRefLabel: oldRef.String(),
+	}
+
+	if err := fs.Check(ctx, "test", labels); err != nil {
+		t.Errorf("connection failed with fallback ref; wanted to succeed: %v", err)
+	}
+	// Should have invalidated both old and new refs.
+	if len(invalidatedRefs) < 2 {
+		t.Errorf("expected at least 2 invalidateHosts calls, got %d: %v", len(invalidatedRefs), invalidatedRefs)
+	}
+	// refreshLayer should have been called 3 times:
+	// 1. with old ref (cached hosts), 2. with old ref (after invalidation), 3. with new ref (fallback)
+	if refreshCount != 3 {
+		t.Errorf("expected 3 refreshLayer calls, got %d", refreshCount)
+	}
+}
+
+func TestCheckSucceedsWithFallbackRefWithoutInvalidateHosts(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	refreshCount := 0
+
+	bl := &breakableLayer{}
+	bl.success = false
+
+	oldRef := reference.Spec{Locator: "registry.example.com/repo/image", Object: "old-tag"}
+	newRef := reference.Spec{Locator: "registry.example.com/repo/image", Object: "new-tag"}
+
+	fs := &filesystem{
+		layer: map[string]layer.Layer{
+			"test": bl,
+		},
+		getSources: func(labels map[string]string) ([]source.Source, error) {
+			refreshCount++
+			refStr := labels[ctdsnapshotters.TargetRefLabel]
+			ref, _ := reference.Parse(refStr)
+			// Only succeed when using the new (fallback) ref.
+			if ref.String() == newRef.String() {
+				bl.success = true
+			}
+			return []source.Source{
+				{Name: ref},
+			}, nil
+		},
+		// invalidateHosts is intentionally nil.
+	}
+
+	ctx = source.WithFallbackImageRef(ctx, newRef.String())
+
+	labels := map[string]string{
+		ctdsnapshotters.TargetRefLabel: oldRef.String(),
+	}
+
+	if err := fs.Check(ctx, "test", labels); err != nil {
+		t.Errorf("connection failed with fallback ref (no invalidateHosts); wanted to succeed: %v", err)
+	}
+	// refreshLayer should have been called 2 times:
+	// 1. with old ref (fails), 2. with new ref (fallback, succeeds)
 	if refreshCount != 2 {
 		t.Errorf("expected 2 refreshLayer calls, got %d", refreshCount)
 	}

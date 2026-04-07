@@ -1234,7 +1234,29 @@ func (fs *filesystem) check(ctx context.Context, l layer.Layer, labels map[strin
 			log.G(ctx).Debug("Successfully refreshed connection after invalidating hosts")
 			return nil
 		}
-		return err
+	}
+
+	// All retries with the original ref's credentials failed.
+	// Try the current pull's image ref (from context) which may have fresh credentials
+	// for the same repository. This handles the case where shared base layers have
+	// snapshot labels pointing to an old image tag whose credentials have been revoked.
+	fallbackRef := source.FallbackImageRef(ctx)
+	originalRef := labels[ctdsnapshotters.TargetRefLabel]
+	if fallbackRef != "" && fallbackRef != originalRef {
+		log.G(ctx).Warnf("retrying with current pull ref %q (original: %q)", fallbackRef, originalRef)
+		merged := make(map[string]string, len(labels))
+		for k, v := range labels {
+			merged[k] = v
+		}
+		merged[ctdsnapshotters.TargetRefLabel] = fallbackRef
+		if fs.invalidateHosts != nil {
+			fs.invalidateHosts(fallbackRef)
+		}
+		_, err = fs.refreshLayer(ctx, l, merged)
+		if err == nil {
+			log.G(ctx).Debug("Successfully refreshed with current pull ref")
+			return nil
+		}
 	}
 
 	return err

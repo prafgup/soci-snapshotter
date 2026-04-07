@@ -100,6 +100,20 @@ type RegistryHosts func(imgRefSpec reference.Spec) ([]docker.RegistryHost, error
 // image reference, forcing fresh credentials to be fetched on the next request.
 type InvalidateHosts func(ref string)
 
+type fallbackImageRefKey struct{}
+
+// WithFallbackImageRef returns a context carrying a fallback image reference
+// for credential lookup when the snapshot's original ref has stale credentials.
+func WithFallbackImageRef(ctx context.Context, ref string) context.Context {
+	return context.WithValue(ctx, fallbackImageRefKey{}, ref)
+}
+
+// FallbackImageRef extracts the fallback image reference from context, if set.
+func FallbackImageRef(ctx context.Context) string {
+	ref, _ := ctx.Value(fallbackImageRefKey{}).(string)
+	return ref
+}
+
 // FromDefaultLabels returns a function for converting snapshot labels to
 // source information based on labels.
 func FromDefaultLabels(hosts RegistryHosts) GetSources {

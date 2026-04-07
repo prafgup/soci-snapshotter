@@ -366,6 +366,13 @@ func (o *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 		}
 	}
 
+	// Store the current image ref for fallback auth during parent layer checks.
+	// When shared base layers have stale credentials from a previous pull,
+	// the check path can retry with this ref's fresh credentials.
+	if ref := base.Labels[ctdsnapshotters.TargetRefLabel]; ref != "" {
+		ctx = source.WithFallbackImageRef(ctx, ref)
+	}
+
 	target, ok := base.Labels[targetSnapshotLabel]
 	// !ok means we are in an active snapshot
 	if !ok {
